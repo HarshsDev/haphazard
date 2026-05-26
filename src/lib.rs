@@ -4,29 +4,34 @@ use std::ptr;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 
+pub trait Reclaim {}
+
+impl<T> Reclaim for T {}
 pub trait Deleter {
-    fn delete(&self, ptr: *mut dyn Drop);
+    unsafe fn delete(&self, ptr: *mut dyn Reclaim);
 }
 
-impl Deleter for fn(*mut (dyn Drop + 'static)) {
-    fn delete(&self, ptr: *mut dyn Drop) {
-        (*self)(ptr)
+impl Deleter for unsafe fn(*mut (dyn Reclaim + 'static)) {
+    unsafe fn delete(&self, ptr: *mut dyn Reclaim) {
+        unsafe { (*self)(ptr) }
     }
 }
 
 pub mod deleters {
-    fn drop_in_place2(ptr: *mut dyn Drop) {
+    use crate::Reclaim;
+
+    unsafe fn drop_in_place2(ptr: *mut dyn Reclaim) {
         unsafe { std::ptr::drop_in_place(ptr) };
     }
     #[allow(non_upper_case_globals)]
-    pub static drop_in_place: fn(*mut dyn Drop) = drop_in_place2;
+    pub static drop_in_place: unsafe fn(*mut dyn Reclaim) = drop_in_place2;
 
-    fn drop_box2(ptr: *mut dyn Drop) {
+    unsafe fn drop_box2(ptr: *mut dyn Reclaim) {
         let _ = unsafe { Box::from(ptr) };
     }
 
     #[allow(non_upper_case_globals)]
-    pub static drop_box: fn(*mut dyn Drop) = drop_box2;
+    pub static drop_box: unsafe fn(*mut dyn Reclaim) = drop_box2;
 }
 
 #[derive(Default)]
@@ -91,7 +96,7 @@ pub struct HazPtrs {
 }
 
 pub struct Retired {
-    ptr: *mut dyn Drop,
+    ptr: *mut dyn Reclaim,
     deleter: &'static dyn Deleter,
     next: AtomicPtr<Retired>,
 }
@@ -100,10 +105,10 @@ struct RetiredList {
     head: AtomicPtr<Retired>,
     count: AtomicUsize,
 }
-#[allow(drop_bounds)]
+// #[allow(drop_bounds)]
 pub trait HazPtrObject
 where
-    Self: Sized + Drop + 'static,
+    Self: Sized + Reclaim + 'static,
 {
     fn domain(&self) -> &HazPtrDomain;
     unsafe fn retire(ptr: *mut Self, deleter: &'static dyn Deleter) {
@@ -112,7 +117,7 @@ where
         }
         unsafe { &*ptr }
             .domain()
-            .retire(ptr as *mut dyn Drop, deleter);
+            .retire(ptr as *mut dyn Reclaim, deleter);
     }
 }
 
@@ -212,7 +217,7 @@ impl HazPtrDomain {
         }
     }
 
-    fn retire(&self, ptr: *mut dyn Drop, deleter: &'static dyn Deleter) {
+    fn retire(&self, ptr: *mut dyn Reclaim, deleter: &'static dyn Deleter) {
         let retired = Box::into_raw(Box::new(Retired {
             ptr,
             deleter,
@@ -242,7 +247,7 @@ impl HazPtrDomain {
         self.bulk_reclaim(0, block)
     }
 
-    fn bulk_reclaim(&self, mut reclaimed: usize, block: bool) -> usize {
+    fn bulk_reclaim(&self, prev_reclaimed: usize, block: bool) -> usize {
         let steal = self
             .retired
             .head
@@ -251,11 +256,15 @@ impl HazPtrDomain {
             return 0;
         }
 
+        let mut reclaimed: usize = 0;
+
         let mut guard_list = HashSet::new();
         let mut node = self.hazptrs.head.load(Ordering::SeqCst);
         while !node.is_null() {
             let n = unsafe { &*node };
-            guard_list.insert(n.ptr.load(Ordering::SeqCst));
+            if n.active.load(Ordering::SeqCst) {
+                guard_list.insert(n.ptr.load(Ordering::SeqCst));
+            }
             node = n.next.load(Ordering::SeqCst);
         }
         let mut node = steal;
@@ -272,17 +281,18 @@ impl HazPtrDomain {
                     tail = Some(remaining);
                 }
             } else {
-                n.deleter.delete(n.ptr);
+                unsafe { n.deleter.delete(n.ptr) };
                 reclaimed += 1;
             }
         }
         self.retired.count.fetch_sub(reclaimed, Ordering::SeqCst);
+        let total_reclaimed = prev_reclaimed + reclaimed;
         let tail = if let Some(tail) = tail {
             assert!(!remaining.is_null());
             tail
         } else {
             assert!(remaining.is_null());
-            return reclaimed;
+            return total_reclaimed;
         };
 
         let head_ptr = &self.retired.head;
@@ -305,10 +315,10 @@ impl HazPtrDomain {
         if !remaining.is_null() && block {
             std::thread::yield_now();
 
-            return self.bulk_reclaim(reclaimed, true);
+            return self.bulk_reclaim(total_reclaimed, true);
         }
 
-        reclaimed
+        total_reclaimed
     }
 }
 
