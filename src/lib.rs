@@ -24,14 +24,14 @@ pub mod deleters {
         unsafe { std::ptr::drop_in_place(ptr) };
     }
     #[allow(non_upper_case_globals)]
-    pub static drop_in_place: unsafe fn(*mut dyn Reclaim) = drop_in_place2;
+    pub const drop_in_place: unsafe fn(*mut dyn Reclaim) = drop_in_place2;
 
     unsafe fn drop_box2(ptr: *mut dyn Reclaim) {
         let _ = unsafe { Box::from(ptr) };
     }
 
     #[allow(non_upper_case_globals)]
-    pub static drop_box: unsafe fn(*mut dyn Reclaim) = drop_box2;
+    pub const drop_box: unsafe fn(*mut dyn Reclaim) = drop_box2;
 }
 
 #[derive(Default)]
