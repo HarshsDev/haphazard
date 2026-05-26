@@ -112,9 +112,6 @@ where
 {
     fn domain(&self) -> &HazPtrDomain;
     unsafe fn retire(ptr: *mut Self, deleter: &'static dyn Deleter) {
-        if !std::mem::needs_drop::<Self>() {
-            return;
-        }
         unsafe { &*ptr }
             .domain()
             .retire(ptr as *mut dyn Reclaim, deleter);
@@ -271,16 +268,18 @@ impl HazPtrDomain {
         let mut remaining = std::ptr::null_mut();
         let mut tail = None;
         while !node.is_null() {
-            let mut n = unsafe { Box::from_raw(node) };
-            node = *n.next.get_mut();
-
+            let current = node;
+            let n = unsafe { &*current };
+            node = n.next.load(Ordering::SeqCst);
             if guard_list.contains(&(n.ptr as *mut u8)) {
-                *n.next.get_mut() = remaining;
-                remaining = Box::into_raw(n);
+                n.next.store(remaining, Ordering::SeqCst);
+                //  remaining = Box::into_raw(n);
+                remaining = current;
                 if tail.is_none() {
                     tail = Some(remaining);
                 }
             } else {
+                let mut n = unsafe { Box::from_raw(current) };
                 unsafe { n.deleter.delete(n.ptr) };
                 reclaimed += 1;
             }
