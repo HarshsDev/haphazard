@@ -108,7 +108,7 @@ struct RetiredList {
 // #[allow(drop_bounds)]
 pub trait HazPtrObject
 where
-    Self: Sized + Reclaim + 'static,
+    Self: Sized + 'static,
 {
     fn domain(&self) -> &HazPtrDomain;
     unsafe fn retire(ptr: *mut Self, deleter: &'static dyn Deleter) {
