@@ -305,6 +305,9 @@ impl<F> HazPtrDomain<F> {
             .fetch_add(still_retired, Ordering::Release);
         (reclaimed, done)
     }
+    pub(crate) fn release(&self, hazard: &HazPtr) {
+        hazard.release();
+    }
 }
 
 impl<F> Drop for HazPtrDomain<F> {
