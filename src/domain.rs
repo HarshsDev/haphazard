@@ -249,8 +249,7 @@ impl<F> HazPtrDomain<F> {
             let n = unsafe { &*node };
             let next = n.next.load(Ordering::Relaxed);
             debug_assert_ne!(node, next);
-            node = n.next.load(Ordering::SeqCst);
-            if guard_list.contains(&(n.ptr as *mut u8)) {
+            if !guard_list.contains(&(n.ptr as *mut u8)) {
                 //     n.next.store(remaining, Ordering::SeqCst);
                 //     //  remaining = Box::into_raw(n);
                 //     remaining = current;
@@ -305,6 +304,7 @@ impl<F> HazPtrDomain<F> {
             .fetch_add(still_retired, Ordering::Release);
         (reclaimed, done)
     }
+    
     pub(crate) fn release(&self, hazard: &HazPtr) {
         hazard.release();
     }
