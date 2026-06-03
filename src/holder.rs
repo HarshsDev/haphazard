@@ -8,27 +8,28 @@ pub struct HazPtrHolder<'domain, F> {
     domain: &'domain HazPtrDomain<F>,
 }
 
-macro_rules! try_protect_actual {
-    ($self: ident, $ptr: ident, $src: ident) => {{
-        $self.hazard.protect($ptr as *mut u8);
-        crate::asymmetric_light_barrier();
-        let ptr2 = $src.load(Ordering::Acquire);
-        if $ptr != ptr2 {
-            $self.hazard.reset();
-            Err(ptr2)
-        } else {
-            Ok(std::ptr::NonNull::new($ptr).map(|nn| {
-                let r = unsafe { nn.as_ref() };
-                debug_assert_eq!(
-                    $self.domain as *const HazPtrDomain<F>,
-                    r.domain() as *const HazPtrDomain<F>,
-                    "object guarded by diff domain than holder used to access it."
-                );
-                r
-            }))
-        }
-    }};
-}
+// macro_rules! try_protect_actual {
+//     ($self: ident, $ptr: ident, $src: ident) => {{
+//         $self.hazard.protect($ptr as *mut u8);
+//         crate::asymmetric_light_barrier();
+//         let ptr2 = $src.load(Ordering::Acquire);
+//         if $ptr != ptr2 {
+//             $self.hazard.reset();
+//             Err(ptr2)
+//         } else {
+//             Ok(std::ptr::NonNull::new($ptr).map(|nn| {
+//                 let r = unsafe { nn.as_ref() };
+//                 debug_assert_eq!(
+//                     $self.domain as *const HazPtrDomain<F>,
+//                     r.domain() as *const HazPtrDomain<F>,
+//                     "object guarded by diff domain than holder used to access it."
+//                 );
+//                 r
+//             }))
+//         }
+//     }};
+// }
+
 impl HazPtrHolder<'static, crate::Global> {
     pub fn global() -> Self {
         HazPtrHolder::for_domain(HazPtrDomain::global())
@@ -61,8 +62,9 @@ impl<'domain, F> HazPtrHolder<'domain, F> {
         let mut ptr = src.load(Ordering::SeqCst);
         loop {
             //  let r =
-            match try_protect_actual!(self, ptr, src) {
-                Ok(r) => break r,
+            match unsafe {self.try_protect(ptr, src)} {
+                Ok(None) => break None,
+                Ok(Some(r)) => break Some(unsafe {&*(r as *const _)}),
                 Err(ptr2) => {
                     ptr = ptr2;
                 }
@@ -80,7 +82,23 @@ impl<'domain, F> HazPtrHolder<'domain, F> {
         'o: 'l,
         F: 'static,
     {
-        try_protect_actual!(self,ptr,src)
+        self.hazard.protect(ptr as *mut u8);
+        crate::asymmetric_light_barrier();
+        let ptr2 = src.load(Ordering::Acquire);
+        if ptr != ptr2 {
+            self.hazard.reset();
+            Err(ptr2)
+        } else {
+            Ok(std::ptr::NonNull::new(ptr).map(|nn| {
+                let r = unsafe { nn.as_ref() };
+                debug_assert_eq!(
+                    self.domain as *const HazPtrDomain<F>,
+                    r.domain() as *const HazPtrDomain<F>,
+                    "Object guarded by different domain than holder used to access it",
+                );
+                r
+            }))
+        }
     }
 
     pub fn reset(&mut self) {
