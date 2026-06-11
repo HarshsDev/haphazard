@@ -1,4 +1,4 @@
-use crate::{Deleter, HazPtr, Reclaim, deleter};
+use crate::{Deleter, HazPtrRecord, HeavyBarrierKind, Reclaim};
 use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize};
@@ -9,12 +9,14 @@ const SYNC_TIME_PERIOD: u64 = std::time::Duration::from_nanos(2000000000).as_nan
 const RCOUNT_THRESHOLD: isize = 1000;
 const HCOUNT_MULTIPLIER: isize = 2;
 
-pub struct HazPtrDomain<F> {
-    hazptrs: HazPtrs,
-    retired: RetiredList,
+pub struct Domain<F> {
+    hazptrs: HazPtrRecords,
+    untagged: RetiredList,
     family: PhantomData<F>,
-    sync_time: AtomicU64,
+    due_time: AtomicU64,
     nbulk_reclaims: AtomicUsize,
+    count: AtomicIsize,
+    shutdown: bool,
 }
 
 #[non_exhaustive]
@@ -25,9 +27,9 @@ impl Global {
     }
 }
 
-static SHARED_DOMAIN: HazPtrDomain<Global> = HazPtrDomain::new(&Global::new());
+static SHARED_DOMAIN: Domain<Global> = Domain::new(&Global::new());
 
-impl HazPtrDomain<Global> {
+impl Domain<Global> {
     pub fn global() -> &'static Self {
         &SHARED_DOMAIN
     }
@@ -36,36 +38,37 @@ impl HazPtrDomain<Global> {
 #[macro_export]
 macro_rules! unique_domain {
     () => {
-        HazPtrDomain::new(&|| {})
+        Domain::new(&|| {})
     };
 }
 
-impl<F> HazPtrDomain<F> {
+impl<F> Domain<F> {
     pub const fn new(_: &F) -> Self {
         Self {
-            hazptrs: HazPtrs {
+            hazptrs: HazPtrRecords {
                 head: AtomicPtr::new(std::ptr::null_mut()),
                 count: AtomicIsize::new(0),
             },
-            retired: RetiredList {
+            untagged: RetiredList {
                 head: AtomicPtr::new(std::ptr::null_mut()),
-                count: AtomicIsize::new(0),
             },
             family: PhantomData,
-            sync_time: AtomicU64::new(0),
+            due_time: AtomicU64::new(0),
             nbulk_reclaims: AtomicUsize::new(0),
+            count: AtomicIsize::new(0),
+            shutdown: false,
         }
     }
 
-    pub(crate) fn acquire(&self) -> &HazPtr {
-        if let Some(hazptr) = self.try_existing_acquire() {
+    pub(crate) fn acquire(&self) -> &HazPtrRecord {
+        if let Some(hazptr) = self.try_acquire_existing() {
             hazptr
         } else {
             self.acquire_new()
         }
     }
 
-    fn try_existing_acquire(&self) -> Option<&HazPtr> {
+    fn try_acquire_existing(&self) -> Option<&HazPtrRecord> {
         let head_ptr = &self.hazptrs.head;
         let mut node = head_ptr.load(Ordering::Acquire);
         while (!node.is_null()) {
@@ -78,8 +81,8 @@ impl<F> HazPtrDomain<F> {
         None
     }
 
-    pub(crate) fn acquire_new(&self) -> &HazPtr {
-        let hazptr = Box::into_raw(Box::new(HazPtr {
+    pub(crate) fn acquire_new(&self) -> &HazPtrRecord {
+        let hazptr = Box::into_raw(Box::new(HazPtrRecord {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
             next: AtomicPtr::new(std::ptr::null_mut()),
             active: AtomicBool::new(true),
@@ -113,67 +116,57 @@ impl<F> HazPtrDomain<F> {
         ptr: *mut (dyn Reclaim + 'domain),
         deleter: &'static dyn Deleter,
     ) {
-        let retired = Box::into_raw(Box::new(unsafe { Retired::new(self, ptr, deleter) }));
-        crate::asymmetric_light_barrier();
-        //    self.retired.count.fetch_add(1, Ordering::SeqCst);
-        let head_ptr = &self.retired.head;
-        let mut head = head_ptr.load(Ordering::Acquire);
-        loop {
-            *unsafe { &mut *retired }.next.get_mut() = head;
-            match head_ptr.compare_exchange_weak(head, retired, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    break;
-                }
-                Err(head_now) => head = head_now,
+        let retired = Box::new(unsafe { Retired::new(self, ptr, deleter) });
+        self.push_list(retired);
+    }
+
+    fn push_list(&self, mut retired: Box<Retired>) {
+        assert!(
+            retired.next.get_mut().is_null(),
+            "only single item retiring is suported atm"
+        );
+        let retired = Box::into_raw(retired);
+        unsafe {
+            self.untagged.push(retired, retired);
+        }
+        self.count.fetch_add(1, Ordering::Release);
+        self.check_threshold_and_reclaim();
+    }
+
+    fn check_threshold_and_reclaim(&self) {
+        let mut rcount = self.check_count_threshold();
+        if rcount == 0 {
+            rcount = self.check_due_time();
+            if rcount == 0 {
+                return;
             }
         }
 
-        self.retired.count.fetch_add(1, Ordering::SeqCst);
-
-        self.check_cleanup_and_reclaim();
+        self.nbulk_reclaims.fetch_add(1, Ordering::Acquire);
+        self.do_reclamation(rcount);
     }
 
-    fn check_cleanup_and_reclaim(&self) {
-        if self.try_timed_cleanup() {
-            return;
+    fn check_count_threshold(&self) -> isize {
+        let rcount = self.count.load(Ordering::Acquire);
+        while rcount > self.threshold() {
+            if self
+                .count
+                .compare_exchange_weak(rcount, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.due_time
+                    .store(Self::now() + SYNC_TIME_PERIOD, Ordering::Release);
+                return rcount;
+            }
         }
-        if Self::reached_threshold(
-            self.retired.count.load(Ordering::Acquire),
-            self.hazptrs.count.load(Ordering::Acquire),
-        ) {
-            self.try_bulk_reclaim();
-        }
+        0
     }
 
-    fn try_bulk_reclaim(&self) {
-        let hc = self.hazptrs.count.load(Ordering::Acquire);
-        let rc = self.retired.count.load(Ordering::Acquire);
-        if !Self::reached_threshold(rc, hc) {
-            return;
-        }
-
-        let rc = self.retired.count.swap(0, Ordering::Release);
-        if !Self::reached_threshold(rc, hc) {
-            return;
-        }
-        self.bulk_reclaim(false);
+    fn threshold(&self) -> isize {
+        RCOUNT_THRESHOLD.max(HCOUNT_MULTIPLIER * self.hazptrs.count.load(Ordering::Acquire))
     }
 
-    fn try_timed_cleanup(&self) -> bool {
-        if !self.check_sync_time() {
-            return false;
-        }
-        self.relaxed_cleanup();
-        true
-    }
-
-    fn relaxed_cleanup(&self) {
-        self.retired.count.store(0, Ordering::Release);
-        self.bulk_reclaim(true);
-    }
-
-    fn check_sync_time(&self) -> bool {
+    fn now() -> u64 {
         use std::convert::TryFrom;
         let time = u64::try_from(
             std::time::SystemTime::now()
@@ -182,57 +175,99 @@ impl<F> HazPtrDomain<F> {
                 .as_nanos(),
         )
         .expect("system time is too far into the future");
-        let sync_time = self.sync_time.load(Ordering::Relaxed);
-        time > sync_time
-            && self
-                .sync_time
+        time
+    }
+
+    fn check_due_time(&self) -> isize {
+        let time = Self::now();
+        let due = self.due_time.load(Ordering::Relaxed);
+        if time < due
+            || self
+                .due_time
                 .compare_exchange(
-                    sync_time,
+                    due,
                     time + SYNC_TIME_PERIOD,
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 )
-                .is_ok()
+                .is_err()
+        {
+            return 0;
+        }
+        self.count.swap(0, Ordering::AcqRel)
     }
 
     pub fn eager_reclaim(&self) -> usize {
-        self.bulk_reclaim(true)
+        let rcount = self.count.swap(0, Ordering::AcqRel);
+        self.nbulk_reclaims.fetch_add(1, Ordering::Acquire);
+        self.do_reclamation(rcount)
+        // self.bulk_reclaim(true)
     }
 
-    fn bulk_reclaim(&self, transitive: bool) -> usize {
-        self.nbulk_reclaims.fetch_add(1, Ordering::Acquire);
-        let mut reclaimed = 0;
+    fn do_reclamation(&self, mut rcount: isize) -> usize {
+        let mut total_reclaimed = 0;
         loop {
-            let steal = self
-                .retired
-                .head
-                .swap(std::ptr::null_mut(), Ordering::SeqCst);
-            crate::asymmetric_heavy_barrier(crate::HeavyBarrierKind::Expedited);
-            if steal.is_null() {
-                return reclaimed;
-            }
+            let mut done = true;
+            let stolen_head = self.untagged.pop_all();
+            if !stolen_head.is_null() {
+                crate::asymmetric_heavy_barrier(crate::HeavyBarrierKind::Expedited);
 
-            //  let mut reclaimed: usize = 0;
-
-            let mut guard_list = HashSet::new();
-            let mut node = self.hazptrs.head.load(Ordering::SeqCst);
-            while !node.is_null() {
-                let n = unsafe { &*node };
-                if n.active.load(Ordering::SeqCst) {
-                    guard_list.insert(n.ptr.load(Ordering::SeqCst));
+                #[allow(clippy::mutable_key_type)]
+                let mut guarded_ptr = HashSet::new();
+                let mut node = self.hazptrs.head.load(Ordering::Acquire);
+                while (!node.is_null()) {
+                    let n = unsafe { &*node };
+                    if n.active.load(Ordering::SeqCst) {
+                        guarded_ptr.insert(n.ptr.load(Ordering::Acquire));
+                    }
+                    node = n.next.load(Ordering::Relaxed);
                 }
-                node = n.next.load(Ordering::SeqCst);
+
+                let mut node = stolen_head;
+                let mut reclaimable = std::ptr::null_mut();
+                let mut unreclaimed = std::ptr::null_mut();
+                let mut unreclaimed_tail = unreclaimed;
+                let mut nreclaimable: isize = 0;
+                while !node.is_null() {
+                    let n = unsafe { &*node };
+                    let next = n.next.load(Ordering::Relaxed);
+                    debug_assert_ne!(node, next);
+                    if !guarded_ptr.contains(&(n.ptr as *mut u8)) {
+                        n.next.store(reclaimable, Ordering::Relaxed);
+                        reclaimable = node;
+                        nreclaimable += 1;
+                    } else {
+                        n.next.store(unreclaimed, Ordering::Relaxed);
+                        unreclaimed = node;
+                        if unreclaimed_tail.is_null() {
+                            unreclaimed_tail = unreclaimed;
+                        }
+                    }
+                    node = next;
+                }
+
+                unsafe {
+                    self.reclaim_unprotected(reclaimable);
+                }
+                done = self.untagged.is_empty();
+                unsafe {
+                    self.untagged.push(unreclaimed, unreclaimed_tail);
+                }
+                rcount -= nreclaimable;
+                total_reclaimed += nreclaimable as usize;
             }
-            let (reclaimed_now, done) = self.bulk_lookup_and_reclaim(steal, guard_list);
-            reclaimed += reclaimed_now;
-            if done || transitive {
+            if rcount != 0 {
+                self.count.fetch_add(rcount, Ordering::Release);
+            }
+            rcount = self.check_count_threshold();
+            if rcount == 0 && done {
                 break;
             }
         }
-
-        self.nbulk_reclaims.fetch_sub(1, Ordering::Release);
-        reclaimed
+        self.nbulk_reclaims.fetch_add(1, Ordering::Acquire);
+        total_reclaimed
     }
+
 
     fn bulk_lookup_and_reclaim(
         &self,
@@ -270,7 +305,7 @@ impl<F> HazPtrDomain<F> {
             }
             node = next;
         }
-        let done = self.retired.head.load(Ordering::Acquire).is_null();
+        let done = self.untagged.head.load(Ordering::Acquire).is_null();
 
         let tail = if let Some(tail) = tail {
             assert!(!remaining.is_null());
@@ -282,7 +317,7 @@ impl<F> HazPtrDomain<F> {
 
         crate::asymmetric_light_barrier();
         // lt done = self.retired.count.fetch_sub(reclaimed, Ordering::SeqCst);
-        let head_ptr = &self.retired.head;
+        let head_ptr = &self.untagged.head;
         let mut head = head_ptr.load(Ordering::Acquire);
         loop {
             *unsafe { &mut *tail }.next.get_mut() = head;
@@ -299,36 +334,59 @@ impl<F> HazPtrDomain<F> {
             }
         }
 
-        self.retired
-            .count
-            .fetch_add(still_retired, Ordering::Release);
+        // self.untagged
+        //     .count
+        //     .fetch_add(still_retired, Ordering::Release);
         (reclaimed, done)
     }
-    
-    pub(crate) fn release(&self, hazard: &HazPtr) {
-        hazard.release();
+
+    fn reclaim_all_objects(&self) {
+        let head = self.untagged.pop_all();
+        unsafe { self.reclaim_list_transitive(head) };
     }
-}
 
-impl<F> Drop for HazPtrDomain<F> {
-    fn drop(&mut self) {
-        let nretired = *self.retired.count.get_mut();
-        let nreclaimed = self.bulk_reclaim(false);
-        //  assert_eq!(nretired, nreclaimed);
-        assert!(self.retired.head.get_mut().is_null());
+    unsafe fn reclaim_list_transitive(&self, head: *mut Retired) {
+        unsafe { self.reclaim_unconditional(head) };
+    }
 
-        let mut node = *self.hazptrs.head.get_mut();
+    unsafe fn reclaim_unconditional(&self, head: *mut Retired) {
+        unsafe { self.reclaim_unprotected(head) };
+    }
+    unsafe fn reclaim_unprotected(&self, mut retired: *mut Retired) {
+        //  let mut node = unsafe{retired};
+        while !retired.is_null() {
+            let next = unsafe { &mut *retired }.next.load(Ordering::Relaxed);
+            let n = unsafe { Box::from_raw(retired) };
+            // let free = unsafe { Box::from_raw(retired)};
+            unsafe { n.deleter.delete(n.ptr) };
+            retired = next;
+        }
+    }
+    fn free_hazptr_recs(&mut self) {
+        let mut node: *mut HazPtrRecord = *self.hazptrs.head.get_mut();
         while !node.is_null() {
-            let mut n: Box<HazPtr> = unsafe { Box::from_raw(node) };
-            assert!(!*n.active.get_mut());
+            let mut n: Box<HazPtrRecord> = unsafe { Box::from_raw(node) };
+            debug_assert!(!*n.active.get_mut());
             node = *n.next.get_mut();
             drop(n);
         }
     }
+
+    pub(crate) fn release(&self, hazard: &HazPtrRecord) {
+        hazard.release();
+    }
 }
 
-pub struct HazPtrs {
-    head: AtomicPtr<HazPtr>,
+impl<F> Drop for Domain<F> {
+    fn drop(&mut self) {
+        self.shutdown = true;
+        self.reclaim_all_objects();
+        self.free_hazptr_recs();
+    }
+}
+
+pub struct HazPtrRecords {
+    head: AtomicPtr<HazPtrRecord>,
     count: AtomicIsize,
 }
 
@@ -340,7 +398,7 @@ struct Retired {
 
 impl Retired {
     unsafe fn new<'domain, F>(
-        _: &'domain HazPtrDomain<F>,
+        _: &'domain Domain<F>,
         ptr: *mut (dyn Reclaim + 'domain),
         deleter: &'static dyn Deleter,
     ) -> Self {
@@ -354,39 +412,70 @@ impl Retired {
 
 struct RetiredList {
     head: AtomicPtr<Retired>,
-    count: AtomicIsize,
 }
 
-/// ```compile_fail
-/// use std::sync::atomic::AtomicPtr;
-/// use haphazard::*;
-/// let dw = HazPtrDomain::global();
-/// let dr = HazPtrDomain::new(&());
-///
-/// let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(&dw, 42))));
-///
-/// // Reader uses a different domain thant the writer!
-/// let mut h = HazPtrHolder::for_domain(&dr);
-///
-/// // This shouldn't compile because families differ.
-/// let _ = unsafe { h.load(&x) }.expect("not null");
-/// ```
-#[cfg(doctest)]
-struct CannotConfuseGlobalWriter;
+impl RetiredList {
+    unsafe fn push(&self, sublist_head: *mut Retired, sublist_tail: *mut Retired) {
+        if sublist_head.is_null() {
+            return;
+        }
 
-/// ```compile_fail
-/// use std::sync::atomic::AtomicPtr;
-/// use haphazard::*;
-/// let dw = HazPtrDomain::new(&());
-/// let dr = HazPtrDomain::global();
-///
-/// let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(&dw, 42))));
-///
-/// // Reader uses a different domain thant the writer!
-/// let mut h = HazPtrHolder::for_domain(&dr);
-///
-/// // This shouldn't compile because families differ.
-/// let _ = unsafe { h.load(&x) }.expect("not null");
-/// ```
-#[cfg(doctest)]
-struct CannotConfuseGlobalReader;
+        let head_ptr = &self.head;
+        let mut head = head_ptr.load(Ordering::Acquire);
+        loop {
+            unsafe { &*sublist_tail }
+                .next
+                .store(head, Ordering::Release);
+            match head_ptr.compare_exchange_weak(
+                head,
+                sublist_head,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(head_now) => head = head_now,
+            }
+        }
+    }
+
+    fn pop_all(&self) -> *mut Retired {
+        self.head.swap(std::ptr::null_mut(), Ordering::Acquire)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Relaxed).is_null()
+    }
+}
+// /// ```compile_fail
+// /// use std::sync::atomic::AtomicPtr;
+// /// use haphazard::*;
+// /// let dw = HazPtrDomain::global();
+// /// let dr = HazPtrDomain::new(&());
+// ///
+// /// let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(&dw, 42))));
+// ///
+// /// // Reader uses a different domain thant the writer!
+// /// let mut h = HazPtrHolder::for_domain(&dr);
+// ///
+// /// // This shouldn't compile because families differ.
+// /// let _ = unsafe { h.load(&x) }.expect("not null");
+// /// ```
+// #[cfg(doctest)]
+// struct CannotConfuseGlobalWriter;
+
+// /// ```compile_fail
+// /// use std::sync::atomic::AtomicPtr;
+// /// use haphazard::*;
+// /// let dw = HazPtrDomain::new(&());
+// /// let dr = HazPtrDomain::global();
+// ///
+// /// let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(&dw, 42))));
+// ///
+// /// // Reader uses a different domain thant the writer!
+// /// let mut h = HazPtrHolder::for_domain(&dr);
+// ///
+// /// // This shouldn't compile because families differ.
+// /// let _ = unsafe { h.load(&x) }.expect("not null");
+// /// ```
+// #[cfg(doctest)]
+// struct CannotConfuseGlobalReader;

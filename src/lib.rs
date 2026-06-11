@@ -4,14 +4,15 @@ mod deleter;
 mod domain;
 mod holder;
 mod object;
-mod ptr;
+mod record;
 
-pub use deleter::{Deleter, Reclaim, deleters};
 pub use domain::Global;
-pub use domain::HazPtrDomain;
+pub use deleter::{Deleter, Reclaim, deleters};
+pub use domain::Domain;
+// pub use domain::HazPtrDomain;
 pub use holder::HazPtrHolder;
 pub use object::{HazPtrObject, HazPtrObjectWrapper};
-pub use ptr::HazPtr;
+pub(crate) use record::HazPtrRecord;
 
 fn asymmetric_light_barrier() {
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);

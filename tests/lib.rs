@@ -28,7 +28,7 @@ fn feels_good() {
     let my_x = unsafe { h.protect(&x) }.expect("not null");
     // valid:
     assert_eq!(my_x.0, 42);
-    h.reset();
+    h.reset_protection();
     // invalid:
     // let _: i32 = my_x.0;
 
@@ -72,7 +72,7 @@ fn feels_good() {
     assert_eq!(drops_42.load(Ordering::SeqCst), 0);
     assert_eq!(my_x.0, 42);
 
-    let n = HazPtrDomain::global().eager_reclaim();
+    let n = Domain::global().eager_reclaim();
     assert_eq!(n, 0);
 
     assert_eq!(drops_42.load(Ordering::SeqCst), 0);
@@ -82,14 +82,14 @@ fn feels_good() {
     assert_eq!(drops_42.load(Ordering::SeqCst), 0);
     // _not_ drop(h2);
 
-    let n = HazPtrDomain::global().eager_reclaim();
+    let n = Domain::global().eager_reclaim();
     assert_eq!(n, 1);
 
     assert_eq!(drops_42.load(Ordering::SeqCst), 0);
     assert_eq!(drops_9001.load(Ordering::SeqCst), 0);
 
     drop(h2);
-    let n = HazPtrDomain::global().eager_reclaim();
+    let n = Domain::global().eager_reclaim();
     assert_eq!(n, 0);
     assert_eq!(drops_9001.load(Ordering::SeqCst), 0);
 }
@@ -97,8 +97,8 @@ fn feels_good() {
 #[test]
 #[should_panic]
 fn feels_bad() {
-    let dw = HazPtrDomain::new(&());
-    let dr = HazPtrDomain::new(&());
+    let dw = Domain::new(&());
+    let dr = Domain::new(&());
 
     let drops_42 = Arc::new(AtomicUsize::new(0));
     let x = AtomicPtr::new(Box::into_raw(Box::new(HazPtrObjectWrapper::with_domain(

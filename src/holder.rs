@@ -1,43 +1,21 @@
-use crate::domain::Global;
-use crate::{HazPtr, HazPtrDomain, HazPtrObject};
+use crate::{HazPtrRecord, Domain, HazPtrObject};
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
 
 pub struct HazPtrHolder<'domain, F> {
-    hazard: &'domain HazPtr,
-    domain: &'domain HazPtrDomain<F>,
+    hazard: &'domain HazPtrRecord,
+    domain: &'domain Domain<F>,
 }
 
-// macro_rules! try_protect_actual {
-//     ($self: ident, $ptr: ident, $src: ident) => {{
-//         $self.hazard.protect($ptr as *mut u8);
-//         crate::asymmetric_light_barrier();
-//         let ptr2 = $src.load(Ordering::Acquire);
-//         if $ptr != ptr2 {
-//             $self.hazard.reset();
-//             Err(ptr2)
-//         } else {
-//             Ok(std::ptr::NonNull::new($ptr).map(|nn| {
-//                 let r = unsafe { nn.as_ref() };
-//                 debug_assert_eq!(
-//                     $self.domain as *const HazPtrDomain<F>,
-//                     r.domain() as *const HazPtrDomain<F>,
-//                     "object guarded by diff domain than holder used to access it."
-//                 );
-//                 r
-//             }))
-//         }
-//     }};
-// }
 
 impl HazPtrHolder<'static, crate::Global> {
     pub fn global() -> Self {
-        HazPtrHolder::for_domain(HazPtrDomain::global())
+        HazPtrHolder::for_domain(Domain::global())
     }
 }
 
 impl<'domain, F> HazPtrHolder<'domain, F> {
-    pub fn for_domain(domain: &'domain HazPtrDomain<F>) -> Self {
+    pub fn for_domain(domain: &'domain Domain<F>) -> Self {
         Self {
             hazard: domain.acquire(),
             domain,
@@ -92,8 +70,8 @@ impl<'domain, F> HazPtrHolder<'domain, F> {
             Ok(std::ptr::NonNull::new(ptr).map(|nn| {
                 let r = unsafe { nn.as_ref() };
                 debug_assert_eq!(
-                    self.domain as *const HazPtrDomain<F>,
-                    r.domain() as *const HazPtrDomain<F>,
+                    self.domain as *const Domain<F>,
+                    r.domain() as *const Domain<F>,
                     "Object guarded by different domain than holder used to access it",
                 );
                 r
@@ -101,7 +79,7 @@ impl<'domain, F> HazPtrHolder<'domain, F> {
         }
     }
 
-    pub fn reset(&mut self) {
+    pub fn reset_protection(&mut self) {
         self.hazard.reset();
     }
 }
