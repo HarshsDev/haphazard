@@ -8,10 +8,13 @@ use std::u8;
 const SYNC_TIME_PERIOD: u64 = std::time::Duration::from_nanos(2000000000).as_nanos() as u64;
 const RCOUNT_THRESHOLD: isize = 1000;
 const HCOUNT_MULTIPLIER: isize = 2;
+const NUM_SHARDS: usize = 8;
+const IGNORED_LOW_BITS: u8 = 8;
+const SHARD_MASK: usize = NUM_SHARDS - 1;
 
 pub struct Domain<F> {
     hazptrs: HazPtrRecords,
-    untagged: RetiredList,
+    untagged: [RetiredList; NUM_SHARDS],
     family: PhantomData<F>,
     due_time: AtomicU64,
     nbulk_reclaims: AtomicUsize,
@@ -44,14 +47,13 @@ macro_rules! unique_domain {
 
 impl<F> Domain<F> {
     pub const fn new(_: &F) -> Self {
+        const RETIRED_LIST: RetiredList = RetiredList::new();
         Self {
             hazptrs: HazPtrRecords {
                 head: AtomicPtr::new(std::ptr::null_mut()),
                 count: AtomicIsize::new(0),
             },
-            untagged: RetiredList {
-                head: AtomicPtr::new(std::ptr::null_mut()),
-            },
+            untagged: [RETIRED_LIST; NUM_SHARDS],
             family: PhantomData,
             due_time: AtomicU64::new(0),
             nbulk_reclaims: AtomicUsize::new(0),
@@ -127,7 +129,7 @@ impl<F> Domain<F> {
         );
         let retired = Box::into_raw(retired);
         unsafe {
-            self.untagged.push(retired, retired);
+            self.untagged[Self::calc_shard(retired)].push(retired, retired);
         }
         self.count.fetch_add(1, Ordering::Release);
         self.check_threshold_and_reclaim();
@@ -208,8 +210,15 @@ impl<F> Domain<F> {
         let mut total_reclaimed = 0;
         loop {
             let mut done = true;
-            let stolen_head = self.untagged.pop_all();
-            if !stolen_head.is_null() {
+            let mut stolen_heads = [std::ptr::null_mut(); NUM_SHARDS];
+            let mut empty = true;
+            for i in 0..NUM_SHARDS {
+                stolen_heads[i] = self.untagged[i].pop_all();
+                if !stolen_heads[i].is_null() {
+                    empty = false;
+                }
+            }
+            if !empty {
                 crate::asymmetric_heavy_barrier(crate::HeavyBarrierKind::Expedited);
 
                 #[allow(clippy::mutable_key_type)]
@@ -222,39 +231,41 @@ impl<F> Domain<F> {
                     }
                     node = n.next.load(Ordering::Relaxed);
                 }
+                let (nreclaimed, is_done) = self.match_reclaim_untagged(stolen_heads, &guarded_ptr);
+                done = is_done;
 
-                let mut node = stolen_head;
-                let mut reclaimable = std::ptr::null_mut();
-                let mut unreclaimed = std::ptr::null_mut();
-                let mut unreclaimed_tail = unreclaimed;
-                let mut nreclaimable: isize = 0;
-                while !node.is_null() {
-                    let n = unsafe { &*node };
-                    let next = n.next.load(Ordering::Relaxed);
-                    debug_assert_ne!(node, next);
-                    if !guarded_ptr.contains(&(n.ptr as *mut u8)) {
-                        n.next.store(reclaimable, Ordering::Relaxed);
-                        reclaimable = node;
-                        nreclaimable += 1;
-                    } else {
-                        n.next.store(unreclaimed, Ordering::Relaxed);
-                        unreclaimed = node;
-                        if unreclaimed_tail.is_null() {
-                            unreclaimed_tail = unreclaimed;
-                        }
-                    }
-                    node = next;
-                }
+                // let mut node = stolen_head;
+                // let mut reclaimable = std::ptr::null_mut();
+                // let mut unreclaimed = std::ptr::null_mut();
+                // let mut unreclaimed_tail = unreclaimed;
+                // let mut nreclaimable: isize = 0;
+                // while !node.is_null() {
+                //     let n = unsafe { &*node };
+                //     let next = n.next.load(Ordering::Relaxed);
+                //     debug_assert_ne!(node, next);
+                //     if !guarded_ptr.contains(&(n.ptr as *mut u8)) {
+                //         n.next.store(reclaimable, Ordering::Relaxed);
+                //         reclaimable = node;
+                //         nreclaimable += 1;
+                //     } else {
+                //         n.next.store(unreclaimed, Ordering::Relaxed);
+                //         unreclaimed = node;
+                //         if unreclaimed_tail.is_null() {
+                //             unreclaimed_tail = unreclaimed;
+                //         }
+                //     }
+                //     node = next;
+                // }
 
-                unsafe {
-                    self.reclaim_unprotected(reclaimable);
-                }
-                done = self.untagged.is_empty();
-                unsafe {
-                    self.untagged.push(unreclaimed, unreclaimed_tail);
-                }
-                rcount -= nreclaimable;
-                total_reclaimed += nreclaimable as usize;
+                // unsafe {
+                //     self.reclaim_unprotected(reclaimable);
+                // }
+                // done = self.untagged.is_empty();
+                // unsafe {
+                //     self.untagged.push(unreclaimed, unreclaimed_tail);
+                // }
+                rcount -= nreclaimed as isize;
+                total_reclaimed += nreclaimed;
             }
             if rcount != 0 {
                 self.count.fetch_add(rcount, Ordering::Release);
@@ -268,81 +279,48 @@ impl<F> Domain<F> {
         total_reclaimed
     }
 
-
-    fn bulk_lookup_and_reclaim(
+    fn match_reclaim_untagged(
         &self,
-        stolen_retired_head: *mut Retired,
-        guard_list: HashSet<*mut u8>,
+        stolen_heads: [*mut Retired; NUM_SHARDS],
+        guarded_ptrs: &HashSet<*mut u8>,
     ) -> (usize, bool) {
-        let mut node = stolen_retired_head;
-        let mut remaining = std::ptr::null_mut();
-        let mut tail = None;
-        let mut reclaimed: usize = 0;
-        let mut still_retired: isize = 0;
-        while !node.is_null() {
-            //  let current = node;
-            let n = unsafe { &*node };
-            let next = n.next.load(Ordering::Relaxed);
-            debug_assert_ne!(node, next);
-            if !guard_list.contains(&(n.ptr as *mut u8)) {
-                //     n.next.store(remaining, Ordering::SeqCst);
-                //     //  remaining = Box::into_raw(n);
-                //     remaining = current;
-                //     if tail.is_none() {
-                //         tail = Some(remaining);
-                //     }
-                // } else {
-                let mut n = unsafe { Box::from_raw(node) };
-                unsafe { n.deleter.delete(n.ptr) };
-                reclaimed += 1;
-            } else {
-                n.next.store(remaining, Ordering::Relaxed);
-                remaining = node;
-                if tail.is_none() {
-                    tail = Some(remaining);
+        let mut unreclaimed = std::ptr::null_mut();
+        let mut unreclaimed_tail = unreclaimed;
+        let mut nreclaimed = 0;
+
+        for i in 0..NUM_SHARDS {
+            let mut node = stolen_heads[i];
+            let mut reclaimable = std::ptr::null_mut();
+            while !node.is_null() {
+                let n = unsafe { &*node };
+                let next = n.next.load(Ordering::Relaxed);
+                debug_assert_ne!(node, next);
+                if !guarded_ptrs.contains(&(n.ptr as *mut u8)) {
+                    n.next.store(reclaimable, Ordering::Relaxed);
+                    reclaimable = node;
+                    nreclaimed += 1;
+                } else {
+                    n.next.store(unreclaimed, Ordering::Relaxed);
+                    unreclaimed = node;
+                    if unreclaimed_tail.is_null() {
+                        unreclaimed_tail = unreclaimed;
+                    }
                 }
-                still_retired += 1;
+                node = next;
             }
-            node = next;
+            unsafe{self.reclaim_unprotected(reclaimable)};
         }
-        let done = self.untagged.head.load(Ordering::Acquire).is_null();
-
-        let tail = if let Some(tail) = tail {
-            assert!(!remaining.is_null());
-            tail
-        } else {
-            assert!(remaining.is_null());
-            return (reclaimed, done);
-        };
-
-        crate::asymmetric_light_barrier();
-        // lt done = self.retired.count.fetch_sub(reclaimed, Ordering::SeqCst);
-        let head_ptr = &self.untagged.head;
-        let mut head = head_ptr.load(Ordering::Acquire);
-        loop {
-            *unsafe { &mut *tail }.next.get_mut() = head;
-            match head_ptr.compare_exchange_weak(
-                head,
-                remaining,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    break;
-                }
-                Err(heah_now) => head = heah_now,
-            }
-        }
-
-        // self.untagged
-        //     .count
-        //     .fetch_add(still_retired, Ordering::Release);
-        (reclaimed, done)
+            let done = self.untagged.iter().all(|u| u.is_empty());
+            unsafe{self.untagged[0].push(unreclaimed, unreclaimed_tail)};
+            (nreclaimed, done)
+        
     }
 
     fn reclaim_all_objects(&self) {
-        let head = self.untagged.pop_all();
+        for i in 0..NUM_SHARDS {
+        let head = self.untagged[i].pop_all();
         unsafe { self.reclaim_list_transitive(head) };
+        }
     }
 
     unsafe fn reclaim_list_transitive(&self, head: *mut Retired) {
@@ -372,6 +350,9 @@ impl<F> Domain<F> {
         }
     }
 
+    fn calc_shard(input: *mut Retired) -> usize {
+        (input as usize >> IGNORED_LOW_BITS) & SHARD_MASK
+    }
     pub(crate) fn release(&self, hazard: &HazPtrRecord) {
         hazard.release();
     }
@@ -415,6 +396,12 @@ struct RetiredList {
 }
 
 impl RetiredList {
+    const fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+
     unsafe fn push(&self, sublist_head: *mut Retired, sublist_tail: *mut Retired) {
         if sublist_head.is_null() {
             return;
