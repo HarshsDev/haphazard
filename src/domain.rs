@@ -1,6 +1,7 @@
 use crate::{Deleter, HazPtrRecord, Reclaim};
 use std::collections::HashSet;
 use std::marker::PhantomData;
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::u8;
@@ -75,13 +76,18 @@ impl<F> Domain<F> {
         let mut tail = std::ptr::null();
         [(); N].map(|_| {
             if !head.is_null() {
-                let rec = unsafe { &*head };
-                head = rec.next.load(Ordering::Relaxed);
                 tail = head;
+                let rec = unsafe { &*head };
+                head = rec.available_next.load(Ordering::Relaxed);
                 rec
             } else {
                 let rec = self.acquire_new();
-                rec.available_next.store(tail as *mut _, Ordering::Relaxed);
+                if !tail.is_null() {
+                    unsafe { &*tail }
+                        .available_next
+                        .store(rec as *const _ as *mut _, Release);
+                }
+                //rec.available_next.store(tail as *mut _, Ordering::Relaxed);
                 tail = rec as *const _;
                 rec
             }
